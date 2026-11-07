@@ -11,6 +11,7 @@ import android.os.Bundle;
 import android.provider.OpenableColumns;
 import android.widget.Toast;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
@@ -32,7 +33,6 @@ public class ShareActivity extends Activity {
     private static final String STATE_INDEX = "index";
     private static final String STATE_SAVED = "saved";
     private static final String STATE_ERROR = "error";
-    private static final String STATE_NAME = "name";
     private static final String STATE_LAUNCHED = "launched";
 
     private final ExecutorService io = Executors.newSingleThreadExecutor();
@@ -42,7 +42,6 @@ public class ShareActivity extends Activity {
     private int index;
     private int savedCount;
     private String firstError;
-    private String currentName;
     private boolean pickerLaunched;
 
     @Override
@@ -50,12 +49,11 @@ public class ShareActivity extends Activity {
         super.onCreate(savedInstanceState);
 
         if (savedInstanceState != null) {
-            sources = restoreSources(savedInstanceState);
+            sources = toUriList(savedInstanceState.get(STATE_SOURCES));
             textContent = savedInstanceState.getString(STATE_TEXT);
             index = savedInstanceState.getInt(STATE_INDEX);
             savedCount = savedInstanceState.getInt(STATE_SAVED);
             firstError = savedInstanceState.getString(STATE_ERROR);
-            currentName = savedInstanceState.getString(STATE_NAME);
             pickerLaunched = savedInstanceState.getBoolean(STATE_LAUNCHED);
         } else {
             Intent intent = getIntent();
@@ -65,7 +63,7 @@ public class ShareActivity extends Activity {
                 finishQuietly();
                 return;
             }
-            sources.addAll(resolveSources(intent));
+            sources = resolveSources(intent);
             if (sources.isEmpty()) {
                 textContent = plainTextOf(intent);
             }
@@ -92,7 +90,6 @@ public class ShareActivity extends Activity {
         outState.putInt(STATE_INDEX, index);
         outState.putInt(STATE_SAVED, savedCount);
         outState.putString(STATE_ERROR, firstError);
-        outState.putString(STATE_NAME, currentName);
         outState.putBoolean(STATE_LAUNCHED, pickerLaunched);
     }
 
@@ -112,7 +109,7 @@ public class ShareActivity extends Activity {
         final Uri source = text != null ? null : sources.get(index);
         // 先推进游标：即使随后被重建，也不会再弹同一个文件的选择器
         index++;
-        copyAsync(source, text, target);
+        saveAsync(source, text, target);
     }
 
     private int itemCount() {
@@ -145,7 +142,6 @@ public class ShareActivity extends Activity {
         if (isFinishing() || isDestroyed()) {
             return;
         }
-        currentName = name;
         Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT)
                 .addCategory(Intent.CATEGORY_OPENABLE)
                 .setType(mime)
@@ -160,9 +156,9 @@ public class ShareActivity extends Activity {
     }
 
     /** 串行处理：写完一个再弹下一个选择器，避免并发写同一个目录。 */
-    private void copyAsync(final Uri source, final String text, final Uri target) {
+    private void saveAsync(final Uri source, final String text, final Uri target) {
         io.execute(() -> {
-            String error = text != null ? writeText(text, target) : copy(source, target);
+            String error = save(source, text, target);
             runOnUiThread(() -> {
                 if (isFinishing() || isDestroyed()) {
                     return;
@@ -192,9 +188,7 @@ public class ShareActivity extends Activity {
         int total = itemCount();
         int failed = index - savedCount;
         if (failed == 0) {
-            toast(total == 1
-                    ? getString(R.string.msg_saved, currentName)
-                    : getString(R.string.msg_saved_count, savedCount));
+            toast(getString(R.string.msg_saved_count, savedCount));
         } else if (savedCount == 0) {
             toast(total == 1
                     ? getString(R.string.msg_save_failed, firstError)
@@ -210,38 +204,39 @@ public class ShareActivity extends Activity {
         finish();
     }
 
-    private String copy(Uri source, Uri target) {
+    /** 文本与流复制合流：成功返回 null，失败返回错误描述。 */
+    private String save(Uri source, String text, Uri target) {
         ContentResolver resolver = getContentResolver();
-        try (InputStream in = resolver.openInputStream(source);
-             OutputStream out = resolver.openOutputStream(target)) {
-            if (in == null) {
-                return "openInputStream 返回 null";
+        try {
+            if (text != null) {
+                try (OutputStream out = require(resolver.openOutputStream(target), "openOutputStream")) {
+                    out.write(text.getBytes(StandardCharsets.UTF_8));
+                }
+            } else {
+                // 先开输入再开输出：provider 给不出源流时，不白建一个空目标文件
+                try (InputStream in = require(resolver.openInputStream(source), "openInputStream");
+                     OutputStream out = require(resolver.openOutputStream(target), "openOutputStream")) {
+                    pump(in, out);
+                }
             }
-            if (out == null) {
-                return "openOutputStream 返回 null";
-            }
-            byte[] buffer = new byte[BUFFER_SIZE];
-            int length;
-            while ((length = in.read(buffer)) != -1) {
-                out.write(buffer, 0, length);
-            }
-            out.flush();
             return null;
         } catch (Exception e) {
             return describeError(e);
         }
     }
 
-    private String writeText(String text, Uri target) {
-        try (OutputStream out = getContentResolver().openOutputStream(target)) {
-            if (out == null) {
-                return "openOutputStream 返回 null";
-            }
-            out.write(text.getBytes(StandardCharsets.UTF_8));
-            out.flush();
-            return null;
-        } catch (Exception e) {
-            return describeError(e);
+    /** provider 返回 null 流时统一成异常，省掉两条路径各写一遍判空。 */
+    private static <T> T require(T stream, String what) throws IOException {
+        if (stream == null) {
+            throw new IOException(what + "-> null");
+        }
+        return stream;
+    }
+
+    private static void pump(InputStream in, OutputStream out) throws IOException {
+        byte[] buffer = new byte[BUFFER_SIZE];
+        for (int length; (length = in.read(buffer)) != -1; ) {
+            out.write(buffer, 0, length);
         }
     }
 
@@ -252,8 +247,7 @@ public class ShareActivity extends Activity {
 
     private static String describeIntent(Intent intent) {
         return "action=" + intent.getAction()
-                + ", type=" + intent.getType()
-                + ", 无 EXTRA_STREAM / getData() / ClipData / EXTRA_TEXT";
+                + ", type=" + intent.getType();
     }
 
     private static boolean isShareAction(String action) {
@@ -269,8 +263,14 @@ public class ShareActivity extends Activity {
         return value.isEmpty() ? null : value;
     }
 
-    private static List<Uri> resolveSources(Intent intent) {
-        List<Uri> result = streamUris(intent);
+    /**
+     * 三层兜底：EXTRA_STREAM → ClipData → getData()。
+     * EXTRA_STREAM 在 SEND 下是单个 Uri、在 SEND_MULTIPLE 下是 ArrayList&lt;Uri&gt;，
+     * 还有应用会塞错槽位，所以统一按 Object 判断，不依赖已废弃的类型化取值方法。
+     */
+    private static ArrayList<Uri> resolveSources(Intent intent) {
+        Bundle extras = intent.getExtras();
+        ArrayList<Uri> result = toUriList(extras == null ? null : extras.get(Intent.EXTRA_STREAM));
         ClipData clipData = intent.getClipData();
         if (result.isEmpty() && clipData != null) {
             for (int i = 0; i < clipData.getItemCount(); i++) {
@@ -284,21 +284,6 @@ public class ShareActivity extends Activity {
             result.add(intent.getData());
         }
         return result;
-    }
-
-    /**
-     * EXTRA_STREAM 在 SEND 下是单个 Uri、在 SEND_MULTIPLE 下是 ArrayList&lt;Uri&gt;，
-     * 还有应用会塞错槽位，所以统一按 Object 判断，不依赖已废弃的类型化取值方法。
-     */
-    private static List<Uri> streamUris(Intent intent) {
-        Bundle extras = intent.getExtras();
-        return extras == null
-                ? new ArrayList<>()
-                : toUriList(extras.get(Intent.EXTRA_STREAM));
-    }
-
-    private static ArrayList<Uri> restoreSources(Bundle state) {
-        return toUriList(state.get(STATE_SOURCES));
     }
 
     private static ArrayList<Uri> toUriList(Object value) {
